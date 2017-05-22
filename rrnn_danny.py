@@ -18,30 +18,25 @@ from theano.sandbox.rng_mrg import MRG_RandomStreams as RandomStreams
 from lasagne.random import get_rng
 
 
-class TimeGate(object):
+class RRNNTimeGate(object):
     """
     """
 
     def __init__(self,
-                 Period=init.Uniform((1, 100 )),
-                 Shift=init.Uniform((0., 1000.)),
-                 On_End=init.Constant(0.05)):
+                 Period=init.Uniform((10, 100))):
         self.Period = Period
-        self.Shift = Shift
-        self.On_End = On_End
-
 
 class RRNNLayer(MergeLayer):
     r"""
     """
 
     # GATE defaults: W_in=init.Normal(0.1), W_hid=init.Normal(0.1), W_cell=init.Normal(0.1), b=init.Constant(0.), nonlinearity=nonlinearities.sigmoid
-    def __init__(self, incoming, time_input, num_units, period,
+    def __init__(self, incoming, time_input, num_units,
                  W_in=lasagne.init.GlorotUniform(),
                  W_hid=lasagne.init.GlorotUniform(),
                  b=lasagne.init.Constant(0.),
                  nonlinearity=nonlinearities.rectify,
-                 timegate=TimeGate(),
+                 timegate=RRNNTimeGate(),
                  hid_init=lasagne.init.Constant(0.),
                  backwards=False,
                  learn_init=False,
@@ -52,7 +47,7 @@ class RRNNLayer(MergeLayer):
                  mask_input=None,
                  only_return_final=False,
                  bn=False,
-                 learn_time_params=[True, True, True],
+                 learn_time_params=[True, True, False],
                  off_alpha=1e-3,
                  **kwargs):
 
@@ -131,7 +126,7 @@ class RRNNLayer(MergeLayer):
         # PHASED LSTM: Initialize params for the time gate
         self.off_alpha = off_alpha
         if timegate == None:
-            timegate = TimeGate()
+            timegate = RRNNTimeGate()
 
         def add_timegate_params(gate, gate_name):
             """ Convenience function for adding layer parameters from a Gate
@@ -147,12 +142,7 @@ class RRNNLayer(MergeLayer):
             #                trainable=learn_time_params[2]))
 
         print('Learnableness: {}'.format(learn_time_params))
-        timegate.Period.range = period
         (self.period_timegate) = add_timegate_params(timegate, 'timegate')
-        self.period_timegate = T.exp(self.period_timegate)
-        self.period_timegate = self.period_timegate.round()
-        print(self.period_timegate.eval())
-        # print(self.period_timegate.eval())
 
         self.W_in = self.add_param(W_in,
                                    (num_inputs, num_units), name="W_in")
@@ -331,62 +321,18 @@ class RRNNLayer(MergeLayer):
 
             # Calculate gates pre-activations and slice
             # gates = input_n + T.dot(hid_previous, W_hid_stacked)
-            gates = input_n + T.dot(hid_previous, self.W_hid)
+            states = input_n + T.dot(hid_previous, self.W_hid)
 
             # Clip gradients
             if self.grad_clipping:
-                gates = theano.gradient.grad_clip(
-                    gates, -self.grad_clipping, self.grad_clipping)
+                states = theano.gradient.grad_clip(
+                    states, -self.grad_clipping, self.grad_clipping)
 
-            # Extract the pre-activation gate values
-            # ingate = slice_w(gates, 0)
-            # forgetgate = slice_w(gates, 1)
-            # cell_input = slice_w(gates, 2)
-            # outgate = slice_w(gates, 3)
+            hid = self.nonlinearity(states)
 
-            # if self.peepholes:
-            #     # Compute peephole connections
-            #     ingate += cell_previous*self.W_cell_to_ingate
-            #     forgetgate += cell_previous*self.W_cell_to_forgetgate
-
-            # Apply nonlinearities
-            # ingate = self.nonlinearity_ingate(ingate)
-            # forgetgate = self.nonlinearity_forgetgate(forgetgate)
-            # cell_input = self.nonlinearity_cell(cell_input)
-            #
-            # # Mix in new stuff
-            # cell = forgetgate*cell_previous + ingate*cell_input
-            #
-            # if self.peepholes:
-            #     outgate += cell*self.W_cell_to_outgate
-            hid = self.nonlinearity(gates)
-
-            # Compute new hidden unit activation
-            # hid = outgate*self.nonlinearity(cell)
             return hid
 
-        ##################### Untocuched start
-        # PHASED LSTM: The actual calculation of the time gate
-        # def calc_time_gate(time_input_n):
-        #     # Broadcast the time across all units
-        #     t_broadcast = time_input_n.dimshuffle([0, 'x'])
-        #     # Get the time within the period
-        #     in_cycle_time = T.mod(t_broadcast + shift_broadcast, period_broadcast)
-        #     # Find the phase
-        #     is_up_phase = T.le(in_cycle_time, on_mid_broadcast)
-        #     is_down_phase = T.gt(in_cycle_time, on_mid_broadcast) * T.le(in_cycle_time, on_end_broadcast)
-        #     # Set the mask
-        #     sleep_wake_mask = T.switch(is_up_phase, in_cycle_time / on_mid_broadcast,
-        #                                T.switch(is_down_phase,
-        #                                         (on_end_broadcast - in_cycle_time) / on_mid_broadcast,
-        #                                         off_slope * (in_cycle_time / period_broadcast)))
-        #
-        #     return sleep_wake_mask
-
-        #################### Untouched end
-
-
-            # PHASED LSTM: The actual calculation of the time gate
+        # RRNN: The actual calculation of the time gate
         def calc_time_gate(time_input_n, refrac_end_prev):
             # Broadcast the time across all units
             t_broadcast = time_input_n.dimshuffle([0, 'x'])
@@ -396,8 +342,6 @@ class RRNNLayer(MergeLayer):
             new_refrac_end = T.switch(sleep_wake_mask, t_broadcast + period_broadcast, refrac_end_prev)
             return sleep_wake_mask, new_refrac_end
 
-        # PHASED LSTM: Mask the updates based on the time phase
-        # def step_masked(input_n, time_input_n, mask_n, cell_previous, hid_previous, *args):
         def step_masked(input_n, time_input_n, mask_n, hid_previous, refrac_end_prev, *args):
             # cell, hid = step(input_n, time_input_n, cell_previous, hid_previous, *args)
             hid = step(input_n, time_input_n, hid_previous, *args)
@@ -414,7 +358,6 @@ class RRNNLayer(MergeLayer):
             # cell = T.switch(mask_n, cell, cell_previous)
             hid = T.switch(mask_n, hid, hid_previous)
 
-            # return [cell, hid]
             return [hid, refrac_end_new]
 
         if mask is not None:
@@ -427,26 +370,13 @@ class RRNNLayer(MergeLayer):
 
         sequences = [input, time_input, mask]
         step_fun = step_masked
-        #####################?????????????????????
-        ones = T.ones((num_batch, 1))
-        # if not isinstance(self.cell_init, Layer):
-        #     # Dot against a 1s vector to repeat to shape (num_batch, num_units)
-        #     cell_init = T.dot(ones, self.cell_init)
 
+        ones = T.ones((num_batch, 1))
         if not isinstance(self.hid_init, Layer):
             # Dot against a 1s vector to repeat to shape (num_batch, num_units)
             hid_init = T.dot(ones, self.hid_init)
-        ###################??????????????????????????????
 
-        # non_seqs = [W_hid_stacked, self.period_timegate, self.shift_timegate, self.on_end_timegate]
-        # non_seqs = [self.W_hid, self.period_timegate, self.shift_timegate, self.on_end_timegate]
         non_seqs = [self.W_hid, self.period_timegate]
-
-        # # The "peephole" weight matrices are only used when self.peepholes=True
-        # if self.peepholes:
-        #     non_seqs += [self.W_cell_to_ingate,
-        #                  self.W_cell_to_forgetgate,
-        #                  self.W_cell_to_outgate]
 
         # When we aren't precomputing the input outside of scan, we need to
         # provide the input weights and biases to the step function
@@ -457,27 +387,19 @@ class RRNNLayer(MergeLayer):
         refrac_end_init = T.dot(ones*0., self.hid_init)
         if self.unroll_scan:
             print('please disable unroll_scan')
-        #     # Retrieve the dimensionality of the incoming layer
-        #     input_shape = self.input_shapes[0]
-        #     # Explicitly unroll the recurrence instead of using scan
-        #     cell_out, hid_out = unroll_scan(
-        #         fn=step_fun,
-        #         sequences=sequences,
-        #         outputs_info=[cell_init, hid_init],
-        #         go_backwards=self.backwards,
-        #         non_sequences=non_seqs,
-        #         n_steps=input_shape[1])
+            # Retrieve the dimensionality of the incoming layer
+            input_shape = self.input_shapes[0]
+            # Explicitly unroll the recurrence instead of using scan
+            cell_out, hid_out = unroll_scan(
+                fn=step_fun,
+                sequences=sequences,
+                outputs_info=[hid_init, refrac_end_init],
+                go_backwards=self.backwards,
+                non_sequences=non_seqs,
+                n_steps=input_shape[1])
         else:
             # Scan op iterates over first dimension of input and repeatedly
             # applies the step function
-            # cell_out, hid_out = theano.scan(
-            #     fn=step_fun,
-            #     sequences=sequences,
-            #     outputs_info=[cell_init, hid_init],
-            #     go_backwards=self.backwards,
-            #     truncate_gradient=self.gradient_steps,
-            #     non_sequences=non_seqs,
-            #     strict=True)[0]
             hid_out, refrac_out = theano.scan(
                 fn=step_fun,
                 sequences=sequences,
